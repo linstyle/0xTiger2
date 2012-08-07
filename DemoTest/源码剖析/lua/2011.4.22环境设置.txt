@@ -1,0 +1,116 @@
+LUA源码分析五:环境设置
+版本日期 2011年4月22日
+
+lua里的环境设置，可以看成是一个临时的域名空间。这个空间里有名字和变量等等。可以试着运行一下以下代码,输出全局的环境
+local l_lindp=1
+g_lindp=1
+for n in pairs(_G) do print(n) end
+
+输出：
+string
+xpcall
+package
+tostring
+print
+os
+unpack
+require
+getfenv
+setmetatable
+next
+assert
+tonumber
+io
+rawequal
+collectgarbage
+getmetatable
+module
+rawset
+Average
+g_lindp    //定义的全局
+...
+
+
+相对于整个开发环境讲，全局的表就是一个局部的表。那么同理，也可以为某个函数设置一个环境。在lua里的实现很巧妙，它并不是通过增加一个表系统来做这事，而是把函数当成了一个对象，环境表只是里面的一个成员：
+#define ClosureHeader \
+	CommonHeader; lu_byte isC; lu_byte nupvalues; GCObject *gclist; \
+	struct Table *env  //存放在这
+
+typedef struct CClosure {
+  ClosureHeader;
+  lua_CFunction f;
+  TValue upvalue[1];
+} CClosure;
+
+整个设置的过程通过luaB_setfenv和lua_setfenv完成
+static int luaB_setfenv (lua_State *L) {
+  luaL_checktype(L, 2, LUA_TTABLE);
+  //取得函数的环境
+  getfunc(L, 0);
+  lua_pushvalue(L, 2);
+  //判断setfenv的参数是否合法，也就是level.
+  if (lua_isnumber(L, 1) && lua_tonumber(L, 1) == 0) {
+    /* change environment of current thread */
+    lua_pushthread(L);
+    lua_insert(L, -2);
+    lua_setfenv(L, -2);
+    return 0;
+  }
+  else if (lua_iscfunction(L, -2) || lua_setfenv(L, -2) == 0)
+    luaL_error(L,
+          LUA_QL("setfenv") " cannot change environment of given object");
+  return 1;
+}
+
+LUA_API int lua_setfenv (lua_State *L, int idx) {
+  StkId o;
+  int res = 1;
+  lua_lock(L);
+  api_checknelems(L, 1);
+  o = index2adr(L, idx);
+  api_checkvalidindex(L, o);
+  api_check(L, ttistable(L->top - 1));
+  switch (ttype(o)) {
+    case LUA_TFUNCTION:
+      //赋值
+      clvalue(o)->c.env = hvalue(L->top - 1);
+      break;
+}
+
+
+
+
+在getfunc(L, 0);里面有段代码的封装非常的简单巧妙：
+
+luaL_optint(L, 1, 1)
+((int)luaL_optinteger(L, (n), (d)))
+LUALIB_API lua_Integer luaL_optinteger (lua_State *L, int narg,
+                                                      lua_Integer def) {
+  return luaL_opt(L, luaL_checkinteger, narg, def);
+}
+
+LUALIB_API lua_Integer luaL_checkinteger (lua_State *L, int narg) {
+  lua_Integer d = lua_tointeger(L, narg);
+  if (d == 0 && !lua_isnumber(L, narg))  /* avoid extra test when d is not 0 */
+    tag_error(L, narg, LUA_TNUMBER);
+  return d;
+}
+
+#define luaL_opt(L,f,n,d)	(lua_isnoneornil(L,(n)) ? (d) : f(L,(n)))
+
+而luaL_optint是外部开放的API
+luaL_optinteger负责组合luaL_checkinteger和luaL_opt
+luaL_checkinteger 是具体的逻辑
+luaL_opt是个最底层的调用函数
+
+
+当编译器执行到对变量去值时，会先去获取当前宿主的环境表里，然后从里面取值
+      case OP_GETGLOBAL: {
+        TValue g;
+        TValue *rb = KBx(i);
+        sethvalue(L, &g, cl->env);
+        lua_assert(ttisstring(rb));
+        Protect(luaV_gettable(L, &g, rb, ra));
+        continue;
+      }
+有了这几个关键点后，lua的env工作方式就很明了了

@@ -1,0 +1,273 @@
+luaL_dofile分析,
+本篇主要说明两个点：
+1.	载入的IO流程，
+2.	lua内部调用函数流程
+
+luaL_dofile(L, “LuaTest.lua”);为例。
+
+
+两个核心的函数
+int luaD_pcall (lua_State *L, Pfunc func, void *u,
+                ptrdiff_t old_top, ptrdiff_t ef)
+                
+int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
+  LUAI_TRY(L, &lj,
+    (*f)(L, ud);
+  );
+}                
+    
+//实际调用两个函数，先分析luaL_loadfile(L,fn)
+#define luaL_dofile(L, fn) \
+	(luaL_loadfile(L, fn) || lua_pcall(L, 0, LUA_MULTRET, 0))
+
+在luaL_loadfile里，主要是几个结构体的传递初始化，因此一些语法上的逻辑将抛开，主要看结构体之间的IO组织和传递。
+luaL_loadfile  //获取输入IO
+            ->getF(lua_Reader), LoadF)   //表示传递这两个参数给下个调用的函数
+Lua_load       //构建ZIO
+            ->ZIO(getF, LoadF)			 //填充一个IO结构
+Lua_protectedparser   //上下文中保护Sparser资源
+		    ->Sparser(ZIO, name(函数名),f_parser)   
+luaD_pcall  //带p开头的，除了调用，还做了一些栈维护的清理工作
+			->执行f_parser(Sparser)      //f_parser是个剖析函数
+luaD_rawrunprotected   //公共的底层调用函数,这里调用f_parser
+f_parser
+            ->Sparser->ZIO->getF(LoadF)  //调用ZIO结构体，得到数据
+
+整个过程就是
+填充IO来源->调用->调用IO->解析读到的内容
+如果有其他解析的需求，整个结构上只要修改ZIO的函数指针，和一些跳转的判断。来看具体代码实现
+
+
+LUALIB_API int luaL_loadfile (lua_State *L, const char *filename) {
+    //…
+	//打开filename文件路径,存放到lf里
+	LoadF lf;
+	status = lua_load(L, getF, &lf, lua_tostring(L, -1));
+}
+关注LoadF这个结构
+typedef struct LoadF {
+  int extraline;   //扩展的命令参数，略过
+  FILE *f;         //打开文件指针
+  char buff[LUAL_BUFFERSIZE];  //读取的缓存
+} LoadF;
+
+往下走lua_load(L, getF, &lf, lua_tostring(L, -1));
+getF:根据LoadF结构调用fread函数
+lua_tostring(L, -1):取到”LuaTest.lua”
+
+
+LUA_API int lua_load (lua_State *L, lua_Reader reader, void *data,
+                      const char *chunkname) {
+  ZIO z;
+  int status;
+  lua_lock(L);
+  if (!chunkname) chunkname = "?";
+  luaZ_init(L, &z, reader, data);
+  status = luaD_protectedparser(L, &z, chunkname);
+  lua_unlock(L);
+  return status;
+}
+又是一个ZIO结构体，并且将reader,data都格式化到里面,
+struct Zio {
+  size_t n;			/* bytes still unread */
+  const char *p;		/* current position in buffer */
+  //存储的是reader函数，也就是读文件
+  lua_Reader reader;
+  //存储的是LoadF结构体
+  void* data;			/* additional data */
+  lua_State *L;			/* Lua state (for reader) */
+};
+
+往下走luaD_protectedparser(L, &z, chunkname);
+int luaD_protectedparser (lua_State *L, ZIO *z, const char *name) {
+  struct SParser p;
+  int status;
+  p.z = z; p.name = name;
+  luaZ_initbuffer(L, &p.buff);
+  status = luaD_pcall(L, f_parser, &p, savestack(L, L->top), L->errfunc);           
+  luaZ_freebuffer(L, &p.buff);
+  return status;
+}
+
+Sparser结构:
+struct SParser {  /* data to `f_parser' */
+  ZIO *z;
+  Mbuffer buff;  /* buffer to be used by the scanner */
+	/*
+	typedef struct Mbuffer {
+  	char *buffer;
+  	size_t n;
+  	size_t buffsize;
+	} Mbuffer;
+	*/
+  //存放的是“LuaTest.lua”
+  const char *name;
+};
+
+
+
+static void f_parser (lua_State *L, void *ud) {
+  int i;
+  //Proto结构比较复杂，先略过
+  Proto *tf;
+  //
+  Closure *cl;
+  struct SParser *p = cast(struct SParser *, ud);
+  int c = luaZ_lookahead(p->z);
+  luaC_checkGC(L);
+  tf = ((c == LUA_SIGNATURE[0]) ? luaU_undump : luaY_parser)(L, p->z,
+                                                             &p->buff, p->name);
+  cl = luaF_newLclosure(L, tf->nups, hvalue(gt(L)));
+  cl->l.p = tf;
+  for (i = 0; i < tf->nups; i++)  /* initialize eventual upvalues */
+    cl->l.upvals[i] = luaF_newupval(L);
+  setclvalue(L, L->top, cl);
+  incr_top(L);
+}
+
+
+int luaD_pcall (lua_State *L, Pfunc func, void *u,
+                ptrdiff_t old_top, ptrdiff_t ef) {
+  int status;
+  unsigned short oldnCcalls = L->nCcalls;
+  ptrdiff_t old_ci = saveci(L, L->ci);
+  lu_byte old_allowhooks = L->allowhook;
+  ptrdiff_t old_errfunc = L->errfunc;
+  L->errfunc = ef;
+  /*
+	func也就是f_parser
+	u也就是Sparser
+    luaD_rawrunprotected具体怎么执行先不关心，只知道会执行f_parser,并且参数是u
+  */  
+  status = luaD_rawrunprotected(L, func, u);
+  if (status != 0) {  /* an error occurred? */
+	//恢复栈，略过
+  }
+  L->errfunc = old_errfunc;
+  return status;
+}
+
+
+跟踪f_parser
+static void f_parser (lua_State *L, void *ud) {
+  int i;
+  Proto *tf;
+  Closure *cl;
+  struct SParser *p = cast(struct SParser *, ud);
+  /*
+核心会调用buff = z->reader(L, z->data, &size);
+然后设置ZIO结构的 p和n
+返回p的头一个字节，似乎判断是否预编译后的文件.
+这里先调用luaY_parser,
+这段函数代码就不具体贴了，做的工作大体是语法解析，构建函数等等
+  */
+  int c = luaZ_lookahead(p->z);
+  luaC_checkGC(L);
+  tf = ((c == LUA_SIGNATURE[0]) ? luaU_undump : luaY_parser)(L, p->z,
+                                                             &p->buff, p->name);
+  cl = luaF_newLclosure(L, tf->nups, hvalue(gt(L)));
+  cl->l.p = tf;
+  for (i = 0; i < tf->nups; i++)  /* initialize eventual upvalues */
+    cl->l.upvals[i] = luaF_newupval(L);
+  setclvalue(L, L->top, cl);
+  incr_top(L);
+}
+
+
+
+接下来分析从lua文件中执行函数。如下代码为例
+t={}
+table.insert(t,100,13)
+在ltablib.c中tinsert下断点，然后观察堆栈
+	LuaSrc.exe!tinsert(lua_State * L=0x00398c28)  行91	C
+ 	LuaSrc.exe!luaD_precall(lua_State * L=0x00398c28, lua_TValue * func=0x003950b8, int nresults=0)  行319 + 0x16 字节	C
+ 	LuaSrc.exe!luaV_execute(lua_State * L=0x00398c28, int nexeccalls=1)  行587 + 0x14 字节	C
+ 	LuaSrc.exe!luaD_call(lua_State * L=0x00398c28, lua_TValue * func=0x003950a8, int nResults=-1)  行377 + 0xb 字节	C
+ 	LuaSrc.exe!f_call(lua_State * L=0x00398c28, void * ud=0x0012fe68)  行800 + 0x16 字节	C
+ 	LuaSrc.exe!luaD_rawrunprotected(lua_State * L=0x00398c28, void (lua_State *, void *)* f=0x00420020, void * ud=0x0012fe68)  行118 + 0x1f 字节	C
+ 	LuaSrc.exe!luaD_pcall(lua_State * L=0x00398c28, void (lua_State *, void *)* func=0x00420020, void * u=0x0012fe68, int old_top=16, int ef=0)  行463 + 0x11 字节	C
+>	LuaSrc.exe!lua_pcall(lua_State * L=0x00398c28, int nargs=0, int nresults=-1, int errfunc=0)  行821 + 0x20 字节	C
+ 	LuaSrc.exe!wmain(int argc=1, wchar_t * * argv=0x00393250)  行55 + 0x29 字节	C++
+ 	LuaSrc.exe!__tmainCRTStartup()  行583 + 0x19 字节	C
+ 	LuaSrc.exe!wmainCRTStartup()  行403	C
+主要把LUA里调用函数的一个规律总结出来(无关代码先剔除)
+LUA_API int lua_pcall (lua_State *L, int nargs, int nresults, int errfunc) {
+  /*
+	struct CallS {  /* data to `f_call' */
+ 	 StkId func;
+  	int nresults;
+	};
+  */
+  struct CallS c;
+  //…其他代码省略
+  //取到要调用的函数体
+  c.func = L->top - (nargs+1);  /* function to be called */
+  c.nresults = nresults;
+  /*
+    对ud的一个调用
+	static void f_call (lua_State *L, void *ud) {
+ 	 struct CallS *c = cast(struct CallS *, ud);
+  	 luaD_call(L, c->func, c->nresults);
+	}
+  */
+  status = luaD_pcall(L, f_call, &c, savestack(L, c.func), func);
+  return status;
+}
+
+往下走luaD_pcall
+int luaD_pcall (lua_State *L, Pfunc func, void *u,
+                ptrdiff_t old_top, ptrdiff_t ef) {
+  //pcall,主要工作是一些堆栈保护，然后调用luaD_rawrunprotected
+  status = luaD_rawrunprotected(L, func, u);
+  return status;
+}
+
+往下走luaD_rawrunprotected
+int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
+  //先设置一些异常的跳转点，然后调用
+  LUAI_TRY(L, &lj,
+    (*f)(L, ud);
+  );
+  return lj.status;
+}
+
+然后就是调用f_call,f_call又调用luaD->pcall,接着走luaD->pcall
+void luaD_call (lua_State *L, StkId func, int nResults) {
+  // luaD_precall做了什么先不关心，走luaV_execute
+  if (luaD_precall(L, func, nResults) == PCRLUA)  /* is a Lua function? */
+    luaV_execute(L, 1);  /* call it */
+}
+luaV_execute是很根据虚拟机字节码跳转的函数
+void luaV_execute (lua_State *L, int nexeccalls) {
+const Instruction *pc;
+//`savedpc' of current function
+pc = L->savedpc;
+const Instruction i = *pc++;
+StkId ra;
+//取出调用的函数
+ra = RA(i);
+      case OP_CALL: {
+        int b = GETARG_B(i);
+        int nresults = GETARG_C(i) - 1;
+        if (b != 0) L->top = ra+b;  /* else previous instruction set top */
+        L->savedpc = pc;
+        //终于快到头了
+        switch (luaD_precall(L, ra, nresults)) {
+        }
+      }
+}
+
+往下走luaD_precall
+int luaD_precall (lua_State *L, StkId func, int nresults) {
+LClosure *cl;
+// #define clvalue(o)	check_exp(ttisfunction(o), &(o)->value.gc->cl)
+cl = &clvalue(func)->l;
+/*
+  #define clvalue(o)	check_exp(ttisfunction(o), &(o)->value.gc->cl)
+  #define curr_func(L)	(clvalue(L->ci->func))
+
+*/
+n = (*curr_func(L)->c.f)(L);  /* do the actual call */ 
+}
+
+接着调用到最终函数tinsert (lua_State *L) 

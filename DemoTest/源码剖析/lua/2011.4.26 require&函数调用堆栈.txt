@@ -1,0 +1,201 @@
+LUA源码分析七:require&函数调用堆栈
+版本日期 2011年4月26日
+
+require的调用其实很简单，熟悉完env的设置后，其实本质上都是走luaL_dofile函数对全局表的设置。do_file完，然后设置环境变量。借助此，把LUA里的函数堆栈方式依次跟调一次。
+如果是熟悉汇编堆栈的形式，对LUA的源码风格很好理解。比如没有实际的变量名，通过对栈的偏移来访问。大于0的表示从base基地址加起，负数的表示从top往后减，或者是表示特定的全局值。因为有这种访问上的规则，所以lua的源码对访问封装的层次很清晰，哪里要回退栈指针，哪里要增加top地址等等。
+
+
+
+static int ll_require (lua_State *L) {
+  const char *name = luaL_checkstring(L, 1);
+  int i;
+
+  lua_settop(L, 1);  /* _LOADED table will be at index 2 */
+  lua_getfield(L, LUA_REGISTRYINDEX, "_LOADED");
+  lua_getfield(L, 2, name);
+
+
+  if (lua_toboolean(L, -1)) {  /* is it there? */
+    if (lua_touserdata(L, -1) == sentinel)  /* check loops */
+      luaL_error(L, "loop or previous error loading module " LUA_QS, name);
+    return 1;  /* package is already loaded */
+  }
+  /* else must load it; iterate over available loaders */
+  lua_getfield(L, LUA_ENVIRONINDEX, "loaders");
+  if (!lua_istable(L, -1))
+    luaL_error(L, LUA_QL("package.loaders") " must be a table");
+  lua_pushliteral(L, "");  /* error message accumulator */
+
+/*
+至此栈的数据
+0x00395108:LUA_REGISTRYINDEX, "_LOADED"
+0x00395118:lua_getfield(L, 2, name)  //name,导入的模块名
+0x00395128:LUA_ENVIRONINDEX, "loaders"
+0x00395138:""
+*/
+  for (i=1; ; i++) {
+/*
+i=1:
+从0x00395128取值赋到栈顶
+0x00395148:LUA_ENVIRONINDEX, "loaders"[1]
+
+i=2:
+从0x00395128取值赋到栈顶
+0x00395148:LUA_ENVIRONINDEX, "loaders"[2]
+
+*/
+    lua_rawgeti(L, -2, i);  /* get a loader */
+    if (lua_isnil(L, -1))
+      luaL_error(L, "module " LUA_QS " not found:%s",
+                    name, lua_tostring(L, -2));
+/*
+i=1:
+0x00395158:lua_pushstring(L, name);
+
+i=2:
+0x00395158:lua_pushstring(L, name);
+*/
+    lua_pushstring(L, name);
+/*
+i=1:
+呼叫0x00395148的函数，name做为参数。呼叫过程见段1
+
+i=2:
+呼叫0x00395148的函数，name做为参数。呼叫过程见段2
+*/
+    lua_call(L, 1, 1);  /* call it */
+/*
+i=1:
+判断是否找到模块名
+*/
+    if (lua_isfunction(L, -1))  /* did it find module? */
+      break;  /* module loaded successfully */
+    else if (lua_isstring(L, -1))  /* loader returned error message? */
+      lua_concat(L, 2);  /* accumulate it */
+    else
+      lua_pop(L, 1);
+  }
+/*
+0x00395158:sentinel
+*/
+  lua_pushlightuserdata(L, sentinel);
+/*
+基地址是L->base = 0x003950f8，
+取到0x00395108:LUA_REGISTRYINDEX, "_LOADED"值。
+把top的值(sentinel)给_LOADED[name],同时top--
+*/
+  lua_setfield(L, 2, name);  /* _LOADED[name] = sentinel */
+/*
+0x00395158:lua_pushstring(L, name)
+*/
+  lua_pushstring(L, name);  /* pass name as argument to module */
+/*
+  调用,将模块环境载入.并且修改了0x00395148函数块,压入一个lua的函数调用结构
+*/
+  lua_call(L, 1, 1);  /* run loaded module */
+  if (!lua_isnil(L, -1))  /* non-nil return? */
+    lua_setfield(L, 2, name);  /* _LOADED[name] = returned value */
+/*
+0x00395158:lua_pushstring(L, name)
+接下来就是善后工作了。注意，_LOADED[name]被设置为true。
+*/
+  lua_getfield(L, 2, name);
+  if (lua_touserdata(L, -1) == sentinel) {   /* module did not set a value? */
+    lua_pushboolean(L, 1);  /* use true as result */
+    lua_pushvalue(L, -1);  /* extra copy to be returned */
+    lua_setfield(L, 2, name);  /* _LOADED[name] = true */
+  }
+  return 1;
+}
+
+/*
+段1
+*/
+static int loader_preload (lua_State *L) {
+/*
+取得0x00395158:lua_pushstring(L, name);
+*/
+  const char *name = luaL_checkstring(L, 1);
+/*
+0x00395168:LUA_ENVIRONINDEX, "preload"
+*/
+  lua_getfield(L, LUA_ENVIRONINDEX, "preload");
+  if (!lua_istable(L, -1))
+    luaL_error(L, LUA_QL("package.preload") " must be a table");
+/*
+0x00395178:从0x00395168LUA_ENVIRONINDEX, "preload"表里，读取name的字段
+
+*/
+  lua_getfield(L, -1, name);
+/*
+ 如果是自定义的，则没找到,压入字符串，供上层判断
+*/
+  if (lua_isnil(L, -1))  /* not found? */
+    lua_pushfstring(L, "\n\tno field package.preload['%s']", name);
+  return 1;
+}
+
+/*
+段2
+*/
+static int loader_Lua (lua_State *L) {
+  const char *filename;
+  const char *name = luaL_checkstring(L, 1);
+/*
+查找路径的规则。如果想知道具体没必要细跟。可以设置一个找不到模块名，
+查看返回的错误信息(带有所有路径名的搜索)即可。
+*/
+  filename = findfile(L, name, "path");
+  if (filename == NULL) return 1;  /* library not found in this path */
+/*
+luaL_loadfile很熟悉了
+*/
+  if (luaL_loadfile(L, filename) != 0)
+    loaderror(L, filename);
+  return 1;  /* library loaded successfully */
+}
+
+0x00395148:LUA_ENVIRONINDEX, "loaders" //lua_rawgeti(L, -2, 1);  /* get a loader */  loader_preload
+0x00395158:lua_pushstring(L, name);
+0x00395168:LUA_ENVIRONINDEX, "preload"
+0x00395178:lua_getfield(L, -1, name)
+0x00395188:
+
+0x00395148:LUA_ENVIRONINDEX, "loaders" //lua_rawgeti(L, -2, 2);  /* get a loader */  loader_preload
+0x00395158:lua_pushstring(L, name);
+	loader_Lua:
+
+
+0x00395158:lua_pushlightuserdata(L, sentinel)
+
+0x00395158:lua_pushstring(L, name)
+0x00395158:lua_getfield(L, 2, name)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

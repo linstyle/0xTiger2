@@ -1,0 +1,77 @@
+/***************************************************
+	OS_Log_Msg_Attributes.h 
+***************************************************/
+class ACE_Export ACE_OS_Log_Msg_Attributes
+{
+	unsigned long priority_mask_;	
+};
+
+
+/**************************************************
+  Log_Msg.h,一个组合体。本来以为是继承
+***************************************************/
+#define ACE_LOG_MSG ACE_Log_Msg::instance ()
+
+class ACE_Export ACE_Log_Msg
+{
+	/*
+	日志写入，日志标志disable/enable, 回调函数，该进/线程的内部信息
+	*/  
+};
+
+ACE_Log_Msg::instance (void)
+{
+	//是否启用线程安全
+	ACE_Thread::getspecific (*(log_msg_tss_key ()), &temp);
+		/*
+		ACE_thread_key_t *log_msg_tss_key (void)
+		{
+  		return &the_log_msg_tss_key;
+		}
+			ACE_Thread::getspecific (ACE_thread_key_t key, void **valuep)
+			{
+			  // ACE_TRACE ("ACE_Thread::getspecific");
+			  return ACE_OS::thr_getspecific (key, valuep);
+			}
+				ACE_INLINE int ACE_OS::thr_getspecific (ACE_thread_key_t key, void **data)
+				{
+					//检测key是否有效
+					return ACE_OS::thr_getspecific_native (key, data);
+				}
+					ACE_OS::thr_getspecific_native (ACE_OS_thread_key_t key, void **data)
+					{
+						*data = ::TlsGetValue (key); //系统函数
+					}
+		*/
+		
+		return temp;
+}
+
+
+/**************************************************
+  Log流程
+***************************************************/             
+//最终调用这个
+ssize_t
+ACE_Log_Msg::log (const ACE_TCHAR *format_str,
+                  ACE_Log_Priority log_priority,
+                  va_list argp)
+{
+  if (this->log_priority_enabled (log_priority) == 0)
+    return 0;
+  /*
+	@ACE_Log_Msg::log_priority_enabled (ACE_Log_Priority log_priority)
+	@{
+	@  return ACE_BIT_ENABLED (this->priority_mask_ |
+	@                          ACE_Log_Msg::process_priority_mask_,
+	@                          log_priority);
+	@}
+  */
+  /*
+  @ACE_BIT_ENABLED(WORD, BIT) (((WORD) & (BIT)) != 0)
+  */
+	
+};
+
+
+

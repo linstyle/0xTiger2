@@ -1,0 +1,125 @@
+LUA源码分析九：Debug."getlocal"
+
+
+函数:{"getlocal", db_getlocal}
+从db_getlocal开始跟调.该函数是把自身的所有变量打印出来。大体的思路是算到执行码，根据执行码的大小限制，遍历函数保存的变量信息，
+然后依次打印。
+
+static int db_getlocal (lua_State *L) {
+  int arg;
+  lua_State *L1 = getthread(L, &arg);
+  lua_Debug ar;
+  const char *name;
+  /*
+  	根据level算出L->ci 和 L->base_ci之间的偏差值。见段1
+  */
+  if (!lua_getstack(L1, luaL_checkint(L, arg+1), &ar))  /* out of range? */
+    return luaL_argerror(L, arg+1, "level out of range");
+  /*
+  	这里的ar只是有一个偏移值，具体的还在lua_getlocal里边。见段2  
+  */
+  name = lua_getlocal(L1, &ar, luaL_checkint(L, arg+2));
+  if (name) {
+    lua_xmove(L1, L, 1);
+    lua_pushstring(L, name);
+    lua_pushvalue(L, -2);
+    return 2;
+  }
+  else {
+    lua_pushnil(L);
+    return 1;
+  }
+}
+
+/*
+	段1
+*/
+CallInfo是要调用的函数信息，数组形式。这里通过level来算出是第几个CallInfo.
+其中一个CallInfo里可能有tailcalls(这是什么还不知道，也算是一种函数调用的优化吧),而
+tailcalls是计算到level里面的。比如
+0x40 L->ci
+0x30 CI(5)
+0x20 CI(0)
+0x10 CI(0)
+..
+0x00 L->base_ci, 可能base在这
+括号表示tailcalls，这时level为7,取得的是0x10的目标CI，返回base_ci到0x10的偏差
+LUA_API int lua_getstack (lua_State *L, int level, lua_Debug *ar) {
+  int status;
+  CallInfo *ci;
+  lua_lock(L);
+  /*
+  	L->ci,顶部CallInfo信息
+  	L->base_ci,底部CallInfo信息
+  */
+  for (ci = L->ci; level > 0 && ci > L->base_ci; ci--) {
+    level--;
+    if (f_isLua(ci))  /* Lua function? */
+      level -= ci->tailcalls;  /* skip lost tail calls */
+  }
+  if (level == 0 && ci > L->base_ci) {  /* level found? */
+    status = 1;
+    /*
+    	算出目标CallInfo的偏差值
+    */
+    ar->i_ci = cast_int(ci - L->base_ci);
+  }
+  else if (level < 0) {  /* level is of a lost tail call? */
+    status = 1;
+    ar->i_ci = 0;
+  }
+  else status = 0;  /* no such level */
+  lua_unlock(L);
+  return status;
+}
+
+
+/*
+	段2
+*/
+lua_getlocal函数的调用关系层如下
+lua_getlocal (lua_State *L, const lua_Debug *ar, int n)
+{
+	//根据ar里的偏差值，取到目标ci
+  CallInfo *ci = L->base_ci + ar->i_ci;
+  findlocal
+	  Proto *fp = getluaproto(ci);
+	  name = luaF_getlocalname(fp, n, currentpc(L, ci))
+}  
+重点是findlocal的封装。
+getluaproto返回函数的属性，先对currentpc展开
+static int currentpc (lua_State *L, CallInfo *ci) {
+  if (!isLua(ci)) return -1;  /* function is not a Lua function? */
+  /*
+  	取的不一定是最末尾的ci
+  */
+  if (ci == L->ci)
+    ci->savedpc = L->savedpc;
+  /*
+  pcRel宏扩展如下，算出ci的执行码和函数的执行码偏差值。中间可以看成塞入了其他
+  的信息，比如全局变量也会对这个差值造成影响
+ 	#define pcRel(pc, p)	(cast(int, (pc) - (p)->code) - 1) 
+  */
+  return pcRel(ci->savedpc, ci_func(ci)->l.p);
+}
+
+来到最后的luaF_getlocalname
+const char *luaF_getlocalname (const Proto *f, int local_number, int pc) {
+  int i;
+  /*
+  	locvars表示存放的函数变量，大小为f->sizelocvars
+  	startpc...endpc,表示在这个范围内的为active变量。
+  */
+  for (i = 0; i<f->sizelocvars && f->locvars[i].startpc <= pc; i++) {
+    if (pc < f->locvars[i].endpc) {  /* is variable active? */
+      local_number--;
+      if (local_number == 0)
+        return getstr(f->locvars[i].varname);
+    }
+  }
+  return NULL;  /* not found */
+}
+
+跟调了下l.p->code和startpc,endpc两个值，在parse的时候就被设置好。
+startpc,endpc被设置成l.p->code类似的边界范围值，比如标识局部变量等。
+而ci->savedpc和l.p->code之间势必还插入了其他的值，所以你会看到luaF_getlocalname中的判断过程

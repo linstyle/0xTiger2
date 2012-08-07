@@ -1,0 +1,83 @@
+/*Auto_Event.h*/
+class ACE_Export ACE_Auto_Event : public ACE_Event
+{
+ //这里面基本没啥事，包装了ACE_Event基类
+}
+
+/*Event.h*/
+class ACE_Event
+{
+ //一些实际的工作函数封装，比如remove, wait, signal,reset等
+ //实际的操作还是靠ACE_OS::来操作
+}
+
+/*OS_NS_Thread.cpp*/
+ACE_OS::event_init
+{
+   CreateEventA();
+   
+}
+
+ACE_OS::event_wait
+{
+  switch (::WaitForSingleObject (*event, INFINITE))
+  {
+  case WAIT_OBJECT_0:
+    return 0;
+  default:
+    {
+      ACE_OS::set_errno_to_last_error ();
+      return -1;
+    }
+  }
+}
+
+ACE_OS::event_timedwait
+{
+   跟event_wait一样，INFINITE由传入值决定
+}
+
+ACE_OS::event_signal
+{
+   SetEvent();
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

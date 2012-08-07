@@ -1,0 +1,125 @@
+/*
+  目前已实现功能
+  2010/05/06
+*/
+ClientPlay:支持协议解析发送调试，控制台模式
+PostofficeRoute(邮局路由):
+支持多核的自动负载绑定(对客户端请求)
+支持对客户端对连接邮局服务器对象请求的返回
+支持对邮局服务器负载的平衡(不带锁实现)
+支持对邮局服务器的管理(一个select模型，支持网络对象和逻辑对象的分开管理(hash))
+
+PostofficeServer(邮局服务器):
+支持多核的自动负载绑定(IOCP)
+支持自动连接邮局路由，并且更新自身信息(负载信息)
+支持客户端连接和管理(网络对象池和逻辑对象池分开管理，O(1)的常量复杂度定位)
+支持逻辑服务器的管理和提权
+实现一个路由表，支持客户端到逻辑服务器的相互转发(O(1)常量复杂度，对客户端的转发正在实现)
+
+ServerBin(逻辑服务器)
+支持对邮局服务器的连接
+支持协议的解析发送
+准备实现场景号的控制
+
+
+
+/*
+  文件夹阅读规则
+*/
+CommonLib: 公共库
+ClientPlay:模拟客户端
+PostofficeRoute: 邮局路由
+PostofficeServer:邮局服务器
+ServerBin:逻辑服务器
+ProjectTemplates:工程模板整理，可直接拷用
+
+每个工程下有这几个大体目录:
+Brbridge:网络层和逻辑层间的粘贴
+Config:配置文件
+Logic :逻辑层
+Network:网络层
+Protocol:协议规则(已废)
+Standalone:单独的模块
+
+进入工程后目录详细分为(除了以上另增):
+Algorithm:数据结构和算法
+Role:角色对象，或者是逻辑对象(隶属Standalone)
+Scene:场景对象，(隶属Standalone)
+
+
+/*
+  起名规则
+*/
+类:
+除了起到见名思意，还要起到指出通信双方的规则。这对底层的模块划分很重要。
+比如在PostofficeServer中 
+/Network
+CServerBinPlayTCP.h
+CServerRouteTCP.h
+其中Server表示程序本身，BinPlay和Route表示通讯的对方
+
+
+资源编号:
+为了效率的原因，经常记住彼此机器上的若干信息
+在哪台机器上		：nInXXXWhich;
+在对象池中的编号：nInXXXPoolRes;
+套接字编号			：nInXXXSocket;
+
+去除原来的identi,在In前缀中默认的语意即identi
+
+
+一些简写:
+Postoffice:邮局，简写为Post
+
+
+
+/*
+  协议编号和处理规则
+*/
+编号使用规则
+目前分为:
+	enum
+	{
+		OrderAction=0,		//表示一个大类动作的标志
+		DoAction=0			  //表示真正执行的动作	
+	};
+	
+OrderAction:
+0:hello world测试类。双方连接后，客户端向服务端发送该协议问候。(必须)
+1:登陆握手信息。通常做为一些信息的请求或者初始化等.适用于非客户端对象
+2:同上，适用于客户端对象
+3:正式工作
+
+空的函数跳转:
+用来填充一些队列的正确索引化，做为一个警告提示，不做为错误对待
+__FillFunc()
+{
+	printf("Warning, __NeverAnythingTodo(), Action is %d, DoAction is %d \n");
+}
+
+
+
+
+/*
+  日志提示符号
+*/
+
+常用语
+-----------------------------
+Warning: 警告,或者提示消息
+Err:	   失败的原因
+Failed:	 失败的描述
+__:		   属于内核维护的信息
+
+
+
+/*
+  接口动作
+*/
+对外部接口:
+对于一个单体对象操作：Close(),  Open()
+对于一个容器数据结构(数组，链表之类)：Add(), Erase()
+TCP：Close()	
+
+内部接口:(内部更多用于空间的开辟释放等语意上)
+Malloc, Release

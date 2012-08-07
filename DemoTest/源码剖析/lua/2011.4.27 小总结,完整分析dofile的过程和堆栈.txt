@@ -1,0 +1,259 @@
+LUA源码分析八:小总结,完整分析dofile的过程和堆栈
+
+
+关于一些语法包装的问题不涉及（可见前面某篇），主要对堆栈排列上的分析。
+一路跟调到static void f_parser (lua_State *L, void *ud)函数，堆栈记录如下：
+
++		L->top	0x003950e8:当前指针
++		L->stack	0x003950a8
++		L->base	0x003950b8
++		L->ci	0x00398e08
+
+跟调到Proto *luaY_parser函数中。该函数主要进行了语法解析，FuncState的建立，最后返回结构体
+Proto。里面具体怎么解析语法等我们都不需要关系，我们只需要关注哪些结果被压入了堆栈。
+Proto *luaY_parser (lua_State *L, ZIO *z, Mbuffer *buff, const char *name) {
+
+  struct LexState lexstate;
+  struct FuncState funcstate;
+  lexstate.buff = buff;
+  /*
+  	不涉及堆栈，只是设置lexstate的一些参数
+  */
+  luaX_setinput(L, &lexstate, z, luaS_new(L, name));
+  /*
+  	会在top上压入2个值，Proto(表示函数属性)和一张表。
+  	L->top排列如下：
+  	L->top	0x003950e8:funcstate->h
+  	L->top	0x003950f8:luaF_newproto(L)
+  */
+  open_func(&lexstate, &funcstate);
+  funcstate.f->is_vararg = VARARG_ISVARARG;  /* main func. is always vararg */
+  luaX_next(&lexstate);  /* read first token */
+  
+  chunk(&lexstate);
+  check(&lexstate, TK_EOS);
+  /*
+  	将之前压入的2个值退出，堆栈恢复为
+  	+		L->top	0x003950e8
+  */
+  close_func(&lexstate);
+  lua_assert(funcstate.prev == NULL);
+  lua_assert(funcstate.f->nups == 0);
+  lua_assert(lexstate.fs == NULL);
+  return funcstate.f;
+}
+
+return上层函数f_parser，继续跟入：
+static void f_parser (lua_State *L, void *ud) {
+  int i;
+  Proto *tf;
+  Closure *cl;
+  struct SParser *p = cast(struct SParser *, ud);
+  int c = luaZ_lookahead(p->z);
+  luaC_checkGC(L);
+  tf = ((c == LUA_SIGNATURE[0]) ? luaU_undump : luaY_parser)(L, p->z,
+                                                             &p->buff, p->name);
+  /*
+  	根据返回回来的函数属性新建一个closure,tf->nups表示多少个upvalues。
+  	并且将tf设置回cl,初始化好upvalues值等
+  */                                                           
+  cl = luaF_newLclosure(L, tf->nups, hvalue(gt(L)));
+  cl->l.p = tf;
+  for (i = 0; i < tf->nups; i++)  /* initialize eventual upvalues */
+    cl->l.upvals[i] = luaF_newupval(L);
+  setclvalue(L, L->top, cl);
+	/*
+		改变了L->top
+  	L->top	0x003950e8:cl,
+  	cl地址为 0x00473780
+	*/  
+  incr_top(L);
+}
+
+一路返回，断点到最初的luaL_loadfile中，该函数最后执行了一句lua_remove(L, fnameindex);
+清除了一些参数(不影响到子调用的压栈)，现在top里面排列如下：
++		L->top	0x003950d8：cl包
++		L->top	0x003950e8：当前指针
++		L->stack	0x003950a8
++		L->base	0x003950b8
++		L->ci	0x00398e08
+
+根据宏
+#define luaL_dofile(L, fn) \
+	(luaL_loadfile(L, fn) || lua_pcall(L, 0, LUA_MULTRET, 0))
+接下来调用lua_pcall函数。
+LUA_API int lua_pcall (lua_State *L, int nargs, int nresults, int errfunc) {
+  struct CallS c;
+	/*
+		nargs为0，这段地址算出来为0x003950d8，
+		也就是我们上文创建的cl包
+	*/
+  c.func = L->top - (nargs+1);  /* function to be called */
+  c.nresults = nresults;
+  /*
+  	savestack算的是c.func和L->stack的差值。
+  	0x003950d8-0x003950a8=48
+  */
+  status = luaD_pcall(L, f_call, &c, savestack(L, c.func), func);
+  adjustresults(L, nresults);
+  lua_unlock(L);
+  return status;
+}
+
+跟入luaD_pcall->luaD_rawrunprotected->f_call->luaD_call->luaD_precall
+int luaD_precall (lua_State *L, StkId func, int nresults) {
+  LClosure *cl;
+  ptrdiff_t funcr;
+  if (!ttisfunction(func)) /* `func' is not a function? */
+    func = tryfuncTM(L, func);  /* check the `function' tag method */
+  /*
+  	savestack算的是c.func和L->stack的差值。
+  	0x003950d8-0x003950a8=48
+  */    
+  funcr = savestack(L, func);
+  cl = &clvalue(func)->l;
+  L->ci->savedpc = L->savedpc;
+  if (!cl->isC) {  /* Lua function? prepare its call */
+    CallInfo *ci;
+    StkId st, base;
+    //取出函数属性
+    Proto *p = cl->p;
+    luaD_checkstack(L, p->maxstacksize);
+    //？？为什么不直接用func呢？
+    func = restorestack(L, funcr);
+    if (!p->is_vararg) {  /* no varargs? */
+      base = func + 1;
+      if (L->top > base + p->numparams)
+        L->top = base + p->numparams;
+    }
+    else {  /* vararg function */
+    	/*
+    		因为不带参数，所以base返回L->top，姑且是这个值
+    	*/
+      int nargs = cast_int(L->top - func) - 1;
+      base = adjust_varargs(L, p, nargs);
+      func = restorestack(L, funcr);  /* previous call may change the stack */
+    }
+    /*
+      设置好ci的堆栈
+      ci->func=0x003950d8
+      ci->base=0x003950e8
+      ci->top= 0x00395108
+      L->savedpc=0x00473860  编译出来的虚拟指令
+    */
+    ci = inc_ci(L);  /* now `enter' new function */
+    ci->func = func;
+    L->base = ci->base = base;
+    ci->top = L->base + p->maxstacksize;
+    lua_assert(ci->top <= L->stack_last);
+    L->savedpc = p->code;  /* starting point */
+    ci->tailcalls = 0;
+    ci->nresults = nresults;
+    /*
+    	清空ci需要的堆栈
+    */
+    for (st = L->top; st < ci->top; st++)
+      setnilvalue(st);
+    /*
+    	L->top=0x00395108  
+    */
+    L->top = ci->top;
+    if (L->hookmask & LUA_MASKCALL) {
+      L->savedpc++;  /* hooks assume 'pc' is already incremented */
+      luaD_callhook(L, LUA_HOOKCALL, -1);
+      L->savedpc--;  /* correct 'pc' */
+    }
+    return PCRLUA;
+  }
+}
+
+跟入执行luaV_execute,根据 L->savedpc获取执行码
+先获取环境表
+      case OP_GETGLOBAL: {
+        TValue g;
+        TValue *rb = KBx(i);
+        sethvalue(L, &g, cl->env);
+        lua_assert(ttisstring(rb));
+        Protect(luaV_gettable(L, &g, rb, ra));
+        continue;
+      }
+
+再
+      case OP_LOADK: {
+        setobj2s(L, ra, KBx(i));
+        continue;
+      }
+前面两个的具体意义都可以先不管，最后的调用.如果ci里有多个函数需要执行，则返回值为
+PCRC,从下一指令的ci设置完毕，即可马上调用
+      case OP_CALL: {
+        int b = GETARG_B(i);
+        int nresults = GETARG_C(i) - 1;
+        if (b != 0) L->top = ra+b;  /* else previous instruction set top */
+        L->savedpc = pc;
+        switch (luaD_precall(L, ra, nresults)) {
+          case PCRLUA: {
+            nexeccalls++;
+            goto reentry;  /* restart luaV_execute over new Lua function */
+          }
+          case PCRC: {
+            /* it was a C function (`precall' called it); adjust results */
+            if (nresults >= 0) L->top = L->ci->top;
+            base = L->base;
+            continue;
+          }
+          default: {
+            return;  /* yield */
+          }
+        }
+      }            
+
+跟调到最后的luaD_precall.上文已经分析过luaD_precall，不同的是if (!cl->isC)的判断。上文中
+为lua function,此次为C function
+int luaD_precall (lua_State *L, StkId func, int nresults) {
+  LClosure *cl;
+  ptrdiff_t funcr;
+  if (!ttisfunction(func)) /* `func' is not a function? */
+    func = tryfuncTM(L, func);  /* check the `function' tag method */
+  funcr = savestack(L, func);
+  cl = &clvalue(func)->l;
+  L->ci->savedpc = L->savedpc;
+  if (!cl->isC) {  /* Lua function? prepare its call */
+ 
+  }
+  else {  /* if is a C function, call it */
+    CallInfo *ci;
+    int n;
+    luaD_checkstack(L, LUA_MINSTACK);  /* ensure minimum stack size */
+    ci = inc_ci(L);  /* now `enter' new function */
+    
+    /*
+    	设置好ci的环境。要执行的起始栈地址为要执行的函数+1，栈顶为L->top+LUA_MINSTACK
+    	ci->func:0x003950e8
+    	L->base:0x003950f8
+    	ci->top:0x00395248
+    */
+    ci->func = restorestack(L, funcr);
+    L->base = ci->base = ci->func + 1;
+    ci->top = L->top + LUA_MINSTACK;
+    lua_assert(ci->top <= L->stack_last);
+    ci->nresults = nresults;
+    
+    if (L->hookmask & LUA_MASKCALL)
+      luaD_callhook(L, LUA_HOOKCALL, -1);
+    lua_unlock(L);
+    /*
+    	执行到最终的函数
+    */
+    n = (*curr_func(L)->c.f)(L);  /* do the actual call */
+    lua_lock(L);
+    if (n < 0)  /* yielding? */
+      return PCRYIELD;
+    else {
+    	/*
+    		整理CI的下一次行为.默认结尾时压入一条return的虚拟指令
+    	*/
+      luaD_poscall(L, L->top - n);
+      return PCRC;
+    }
+  }
+}
